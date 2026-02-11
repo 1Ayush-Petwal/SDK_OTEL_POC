@@ -145,6 +145,6 @@ docker compose down
 
 ![Trace_Timeline](public/trace_timeline.png)
 
-![Terminal_Output](public/terminal_output.png)
+![Terminal_Output](public/terminal.png)
 
 Rest of the images are in the `public` folder.
