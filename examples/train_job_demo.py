@@ -19,6 +19,7 @@ Usage:
 
 import sys
 import os
+import socket
 
 # ── OpenTelemetry SDK configuration (app-side only) ─────────────────────────
 from opentelemetry import trace
@@ -29,13 +30,26 @@ from opentelemetry.sdk.trace.export import (
 )
 from opentelemetry.sdk.resources import Resource
 
+
+def _is_collector_reachable(host: str = "localhost", port: int = 4317, timeout: float = 1.0) -> bool:
+    """Return True if the OTel Collector's gRPC port is accepting connections."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
+
 # Attempt OTLP export; fall back to console if the collector is unreachable.
 try:
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
         OTLPSpanExporter,
     )
 
-    exporter = OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True)
+    if not _is_collector_reachable():
+        raise RuntimeError("OTel Collector not reachable on localhost:4317")
+
+    exporter = OTLPSpanExporter(endpoint="localhost:4317", insecure=True)
     export_target = "OTel Collector → Jaeger"
 except Exception:
     exporter = ConsoleSpanExporter()

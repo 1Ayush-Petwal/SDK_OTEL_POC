@@ -81,7 +81,7 @@ python examples/train_job_demo.py
 
 You'll see the submitted job, injected `TRACEPARENT`, and spans printed to the console.
 
-### 3. Run with Jaeger (Optional)
+### 3. Run with Jaeger 
 
 ```bash
 # Start the observability stack
@@ -143,7 +143,7 @@ docker compose down
 
 ## Output Images:
 
-![Trace_Timeline](public/trace_timeline.png)
+![Trace_Timeline](public/trace_1.png)
 
 ![Terminal_Output](public/terminal.png)
 
