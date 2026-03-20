@@ -1,150 +1,157 @@
 # Kubeflow OpenTelemetry PoC
 
-A proof-of-concept demonstrating how [OpenTelemetry](https://opentelemetry.io/) can be integrated into the **Kubeflow Training SDK** to add observability across its client libraries. This PoC covers distributed tracing, W3C context propagation to Kubernetes pods, GenAI semantic conventions, configurable exporters, and the API-vs-SDK separation that keeps the library lightweight.
+Proof-of-concept for adding native OpenTelemetry observability to the **Kubeflow Training SDK** — distributed tracing, metrics, W3C context propagation, and zero overhead for non-OTel users.
+
+---
+
+## Problem
+
+The Kubeflow Training SDK has no structured observability. Users cannot answer:
+- Which Kubernetes API call was slow during job submission?
+- Did the error happen in the SDK or the K8s API server?
+- How many jobs are running, and what fraction fail?
+
+---
+
+## Solution
+
+Instrument the SDK using `opentelemetry-api` only. Users who don't configure a provider get a **no-op tracer** — zero overhead. Users who do get full traces and metrics automatically.
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      User Application                          │
-│  examples/train_job_demo.py                                    │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │  • Configures TracerProvider (OpenTelemetry SDK)           │ │
-│  │  • Calls MockTrainerClient.train()                        │ │
-│  │  • Records GenAI token-usage attributes                   │ │
-│  └────────────────────────────────────────────────────────────┘ │
-│        │  uses                                                  │
-│        ▼                                                        │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │  sdk_mock/ — Kubeflow SDK (Library)                       │ │
-│  │  Uses opentelemetry-api ONLY (no SDK)                     │ │
-│  │                                                            │ │
-│  │  trainer_client.py                                        │ │
-│  │    └─ Creates span "trainer.submit_job"                   │ │
-│  │    └─ Sets GenAI + Kubeflow attributes                    │ │
-│  │                                                            │ │
-│  │  propagator.py                                            │ │
-│  │    └─ inject_context_to_env()                             │ │
-│  │    └─ Serialises trace context → TRACEPARENT env var      │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└────────────────────┬────────────────────────────────────────────┘
-                     │ OTLP/gRPC (:4317)
-                     ▼
-          ┌──────────────────────┐
-          │   OTel Collector     │
-          │   (otel-config.yaml) │
-          └──────────┬───────────┘
-                     │ OTLP/gRPC
-                     ▼
-          ┌──────────────────────┐
-          │   Jaeger             │
-          │   UI → :16686        │
-          └──────────────────────┘
+User Application (examples/train_job_demo.py)
+  └── configures TracerProvider + OTLP exporter
+        │
+        ▼
+  MockTrainerClient          [INTERNAL span]   sdk_mock/trainer_client.py
+  └── MockKubernetesBackend  [CLIENT span]     sdk_mock/backends/kubernetes_backend.py
+        └── events: resolving_runtime, building_job_spec,
+                    traceparent_injected, submitting_to_k8s_api
+                    │
+                    ▼ OTLP/gRPC (:4317)
+             OTel Collector  →  Jaeger (:16686)
 ```
 
-### API vs SDK — Why It Matters
+**Span depth is fixed at 2.** Sub-operations are span events, not child spans — traces stay readable.
 
-| Layer | Dependency | Rationale |
-|-------|-----------|-----------|
-| **Library** (`sdk_mock/`) | `opentelemetry-api` only | Keeps the Kubeflow SDK lightweight; users who don't enable tracing get a no-op tracer with zero overhead. |
-| **Application** (`examples/`) | `opentelemetry-sdk` + exporter | The end-user opts in to observability by configuring a `TracerProvider` and exporter. |
+---
 
-## Repository Structure
+## Key Features
 
-```
-kubeflow-otel-poc/
-├── README.md                  # This file
-├── docker-compose.yaml        # Launches Jaeger + OTel Collector
-├── otel-config.yaml           # Collector configuration
-├── requirements.txt           # Python dependencies
-├── sdk_mock/                  # Mocked Kubeflow SDK components
-│   ├── __init__.py
-│   ├── trainer_client.py      # Instrumented MockTrainerClient
-│   └── propagator.py          # W3C context injection logic
-└── examples/
-    └── train_job_demo.py      # End-user demo script
-```
+### 1. API-only library instrumentation
+`sdk_mock/` imports `opentelemetry-api` only — never `opentelemetry-sdk`. Non-OTel users bear zero cost (no threads, no memory, no network).
+
+### 2. Two-level span hierarchy
+| Span | Kind | Where |
+|------|------|--------|
+| `MockTrainerClient.train` | INTERNAL | User-facing contract: what was requested |
+| `MockKubernetesBackend.train` | CLIENT | Execution: K8s API calls and timing |
+
+### 3. W3C Trace Context propagation
+`trace_env_vars()` serialises the active span context into `TRACEPARENT` / `TRACESTATE` env vars, injected into the pod spec before the K8s API call — so pod-side telemetry joins the same trace.
+
+### 4. Four metrics instruments (low-cardinality only)
+| Metric | Type | Dimensions |
+|--------|------|-----------|
+| `kf.training.jobs.submitted` | Counter | `backend.kind`, `trainer.kind` |
+| `kf.training.operation.latency` | Histogram (s) | `operation`, `backend.kind` |
+| `kf.training.jobs.running` | UpDownCounter | `backend.kind` |
+| `kf.training.failures` | Counter | `operation`, `error.type`, `backend.kind` |
+
+High-cardinality values (job names, runtime names) go on **spans only** — never metric dimensions.
+
+### 5. Typed attribute constants (`observability/attributes.py`)
+Domain-grouped constants (`JOB_NAME`, `TRAINER_KIND`, `BACKEND_KIND`, …) prevent silent typos and enable IDE autocomplete. `gen_ai.request.model` is set only when a model URI is explicitly present.
+
+### 6. Configurable exporter with console fallback
+Demo auto-detects environment: OTLP → Collector → Jaeger when the stack is up; falls back to `ConsoleSpanExporter` when it's not.
+
+### 7. Full test suite — 15/15 passing
+`capture_spans()` patches module-level `_tracer` references via `unittest.mock.patch` — avoids the one-shot `set_tracer_provider()` restriction and works across all 15 tests independently.
+
+---
 
 ## Quick Start
 
-### 1. Install Dependencies
-
 ```bash
+# 1. Install
 pip install -r requirements.txt
-```
 
-### 2. Run the Demo (Console Output)
+# 2. Run tests
+.venv/bin/python -m pytest tests/ -v
 
-```bash
-python examples/train_job_demo.py
-```
+# 3. Demo — console only (no Docker needed)
+.venv/bin/python examples/train_job_demo.py
 
-You'll see the submitted job, injected `TRACEPARENT`, and spans printed to the console.
-
-### 3. Run with Jaeger 
-
-```bash
-# Start the observability stack
+# 4. Demo — full stack (traces visible in Jaeger)
 docker compose up -d
-
-# Run the demo (spans now go to Jaeger)
-python examples/train_job_demo.py
-
-# Open Jaeger UI
-open http://localhost:16686
+.venv/bin/python examples/train_job_demo.py
+open http://localhost:16686   # service: kubeflow-training-demo
 ```
 
-Search for service **`kubeflow-training-demo`** to see the trace with the `trainer.submit_job` span and all its attributes.
+---
 
-## Features Demonstrated in This PoC
+## Output
 
-The table below maps each expected feature to where it is showcased in the codebase:
+### Tests — 15/15 passing
+![Testing](public/Testing_POC.png)
 
-| # | Expected Feature | Where It's Demonstrated |
-|---|-----------------|------------------------|
-| 1 | **Add OpenTelemetry instrumentation to key Kubeflow SDK components** | `sdk_mock/trainer_client.py` — The `MockTrainerClient` is instrumented using `opentelemetry-api`. A span `"trainer.submit_job"` is created on every `.train()` call with rich attributes (`gen_ai.request.model`, `kubeflow.job_type`, etc.). |
-| 2 | **Enable distributed tracing for pipeline execution and SDK operations** | `sdk_mock/propagator.py` — `inject_context_to_env()` serializes the active trace context into a W3C `TRACEPARENT` env var. This is the mechanism that lets a remote Kubernetes Pod continue the same trace started by the SDK. |
-| 3 | **Collect and export metrics related to AI/ML workloads** | `examples/train_job_demo.py` — GenAI semantic convention attributes are recorded on spans: `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, and a `"Fine-tuning started"` event. These follow the [OTel GenAI conventions](https://opentelemetry.io/blog/2024/otel-generative-ai/). |
-| 4 | **Provide configurable OTel exporters and sampling options** | `examples/train_job_demo.py` — The demo auto-detects the environment: it tries the **OTLP gRPC exporter** (→ Collector → Jaeger) and falls back to a **ConsoleSpanExporter** if the Collector is unreachable. The `TracerProvider` is configured app-side, not inside the library. |
-| 5 | **Documentation and examples demonstrating observability setup and usage** | This `README.md` + `examples/train_job_demo.py` — Full quick-start guide, architecture diagram, and a runnable demo script. |
+### Console fallback (no collector)
+Span JSON printed to terminal — no stack required.
 
-### How the API-vs-SDK Separation Works
+![No Collector](public/No_collector.png)
 
-The most important design principle: **library code uses only `opentelemetry-api`**, never `opentelemetry-sdk`.
+### With collector → Jaeger
+![With Collector](public/With_Collector.png)
 
-- If a user **does not** configure a `TracerProvider`, all tracing calls inside the SDK become **no-ops** with zero performance overhead.
-- If a user **does** configure a `TracerProvider` (as in `train_job_demo.py`), spans are automatically created and exported — no SDK code changes needed.
+### Trace in Jaeger — 3-level hierarchy
+`fine_tune_workflow` → `MockTrainerClient.train` → `MockKubernetesBackend.train`
 
-This is identical to how popular libraries like `requests`, `flask`, and `django` are instrumented in the OpenTelemetry ecosystem.
+![New Traces](public/New_traces.png)
 
-## SDK Clients Covered
+### Trace timeline
+![Timeline](public/trace_timeline.png)
 
-This PoC mocks the **TrainerClient** (`MockTrainerClient`), but the same instrumentation pattern applies directly to all Kubeflow SDK clients:
+### Flamegraph view
+![Flamegraph](public/trace_flamegraph.png)
 
-| SDK Client | What Would Be Instrumented | Span / Attributes |
-|------------|---------------------------|--------------------|
-| **TrainerClient** *(demonstrated)* | `.train()` — job submission, model config | `trainer.submit_job`, `gen_ai.request.model`, `kubeflow.job_type` |
-| **KubeflowClient** | `.create_run()`, `.get_run()` — pipeline operations | `pipeline.create_run`, `pipeline.run_id`, `pipeline.status` |
-| **KFPClient** (Pipelines) | `.create_experiment()`, `.run_pipeline()` | `kfp.create_experiment`, `kfp.pipeline_name`, `kfp.experiment_id` |
-| **KatibClient** | `.create_experiment()` — hyperparameter tuning | `katib.create_experiment`, `katib.objective`, `katib.algorithm` |
-| **KFServingClient / InferenceClient** | `.create()`, `.predict()` — model serving | `inference.create_service`, `inference.predict`, `gen_ai.request.model` |
+### Spans table
+![Spans Table](public/trace_spans_table.png)
 
-For each client, the pattern is the same:
-1. Get a **tracer** via `trace.get_tracer("kubeflow-sdk")`
-2. Wrap key methods with `tracer.start_as_current_span()`
-3. Set semantic attributes on the span
-4. Call `inject_context_to_env()` before creating K8s resources
+### Trace statistics
+![Statistics](public/trace_statistics.png)
+
+---
+
+## Repo Structure
+
+```
+kubeflow-otel-poc/
+├── sdk_mock/
+│   ├── observability/
+│   │   ├── __init__.py          # make_tracer() / make_meter() factories
+│   │   ├── attributes.py        # typed attribute-key constants
+│   │   └── propagation.py       # trace_env_vars() — W3C context injection
+│   ├── backends/
+│   │   ├── kubernetes_backend.py  # CLIENT span, span events
+│   │   └── local_backend.py       # INTERNAL span (local subprocess)
+│   └── trainer_client.py          # INTERNAL span + 4 metrics instruments
+├── tests/
+│   ├── helpers.py               # capture_spans() via mock.patch
+│   └── test_trainer_client.py   # 15 tests across 5 classes
+├── examples/
+│   └── train_job_demo.py        # 3-level trace demo, OTLP + console fallback
+├── docker-compose.yaml          # Jaeger + OTel Collector
+└── otel-config.yaml             # Collector pipeline config
+```
+
+---
 
 ## Cleanup
 
 ```bash
 docker compose down
 ```
-
-## Output Images:
-
-![Trace_Timeline](public/trace_1.png)
-
-![Terminal_Output](public/terminal.png)
-
-Rest of the images are in the `public` folder.
