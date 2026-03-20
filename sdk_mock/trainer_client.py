@@ -1,149 +1,149 @@
+"""MockTrainerClient — INTERNAL spans wrapping a backend layer.
+
+Depends on opentelemetry-api only; opentelemetry-sdk is never imported here.
+When no TracerProvider is configured the tracer and meter are no-ops with zero
+performance overhead.
+
+Span hierarchy produced per operation:
+
+    MockTrainerClient.train       [INTERNAL]   ← what the user called
+        └── MockKubernetesBackend.train  [CLIENT]  ← what actually ran
+
+Sub-operations within the backend are span events, not child spans, so traces
+stay readable without losing debugging detail.
 """
-Mock of the Kubeflow TrainerClient, instrumented with the OpenTelemetry API.
+import time
 
-IMPORTANT: This module depends ONLY on opentelemetry-api (not opentelemetry-sdk).
-This keeps the Kubeflow SDK lightweight — users who don't configure a
-TracerProvider will get a no-op tracer and zero overhead.
-"""
+from opentelemetry.trace import SpanKind, StatusCode
 
-from opentelemetry import trace
-from opentelemetry.trace import Status, StatusCode
+from .backends import MockKubernetesBackend
+from .observability import make_meter, make_tracer
+from .observability.attributes import (
+    BACKEND_KIND,
+    ERROR_KIND,
+    JOB_NAME,
+    JOB_STATUS,
+    MODEL_NAME,
+    NODE_COUNT,
+    OPERATION,
+    RUNTIME_NAME,
+    TRAINER_KIND,
+)
 
-from .propagator import inject_context_to_env
+_tracer = make_tracer()
+_meter  = make_meter()
 
-# Library-level tracer — uses the API only.
-tracer = trace.get_tracer("kubeflow-sdk-mock")
+# ── Instruments ────────────────────────────────────────────────────────────────
+# Metric names use a shorter "kf.*" prefix to distinguish this PoC's scope
+# from the full SDK's "kubeflow.*" production namespace.
+
+_jobs_submitted = _meter.create_counter(
+    "kf.training.jobs.submitted",
+    unit="{job}",
+    description="Total training jobs submitted via the SDK.",
+)
+_op_latency = _meter.create_histogram(
+    "kf.training.operation.latency",
+    unit="s",
+    description="Wall-clock time of each SDK operation.",
+)
+_jobs_running = _meter.create_up_down_counter(
+    "kf.training.jobs.running",
+    unit="{job}",
+    description="Jobs currently tracked as active.",
+)
+_failures = _meter.create_counter(
+    "kf.training.failures",
+    unit="{error}",
+    description="Total operation failures, dimensioned by error class and operation.",
+)
 
 
 class MockTrainerClient:
-    """
-    Simulates the Kubeflow Training SDK's TrainerClient.
+    """Simulates TrainerClient from the Kubeflow Training SDK.
 
-    When `.train()` is called it:
-      1. Opens a span representing the job-submission process.
-      2. Records GenAI and Kubeflow-specific attributes on the span.
-      3. Generates a TRACEPARENT env var that would be injected into
-         the Kubernetes Pod spec so the remote job inherits the trace.
+    Each public method opens an INTERNAL span that wraps a backend call.
+    The backend creates its own CLIENT span, producing the two-level hierarchy
+    visible in trace UIs (Jaeger, Grafana Tempo, etc.).
     """
+
+    def __init__(self, backend=None, namespace: str = "default"):
+        self._backend = backend or MockKubernetesBackend(namespace=namespace)
 
     def train(
         self,
-        trainer_func: str = "default_train_script",
-        model_name: str = "llama-3",
+        trainer_kind: str = "CustomTrainer",
+        runtime: str = "torch-distributed",
+        num_nodes: int = 1,
+        model_name: str | None = None,
     ) -> str:
-        """Submit a mock training job and return a fake job ID."""
+        """Submit a training job and return the job name."""
+        t0 = time.perf_counter()
+        with _tracer.start_as_current_span(
+            "MockTrainerClient.train",
+            kind=SpanKind.INTERNAL,
+        ) as span:
+            span.set_attribute(TRAINER_KIND, trainer_kind)
+            span.set_attribute(RUNTIME_NAME, runtime)
+            span.set_attribute(NODE_COUNT, num_nodes)
 
-        with tracer.start_as_current_span("trainer.submit_job") as span:
-            # ── GenAI semantic conventions ──
-            span.set_attribute("gen_ai.request.model", model_name)
-            span.set_attribute("gen_ai.system", "kubeflow-training")
+            # Only record gen_ai.request.model when there is actually a model
+            # URI present. gen_ai.usage.* attributes are for inference, not training.
+            if model_name:
+                span.set_attribute(MODEL_NAME, model_name)
 
-            # ── Kubeflow-specific attributes ──
-            span.set_attribute("kubeflow.job_type", "PyTorchJob")
-            span.set_attribute("kubeflow.trainer_func", trainer_func)
+            try:
+                job_name = self._backend.train(
+                    trainer_kind=trainer_kind, runtime=runtime
+                )
+                span.set_attribute(JOB_NAME, job_name)
+                span.set_status(StatusCode.OK)
 
-            # ── Context propagation (the hard part) ──
-            pod_env_vars = inject_context_to_env()
+                _jobs_submitted.add(1, {BACKEND_KIND: "kubernetes", TRAINER_KIND: trainer_kind})
+                _jobs_running.add(1, {BACKEND_KIND: "kubernetes"})
+                return job_name
 
-            print(f"  📦  Submitting job for model '{model_name}'...")
-            print(f"  🔗  Injecting TRACEPARENT: {pod_env_vars.get('TRACEPARENT')}")
+            except Exception as exc:
+                span.set_status(StatusCode.ERROR, str(exc))
+                span.record_exception(exc)
+                _failures.add(
+                    1,
+                    {OPERATION: "train", ERROR_KIND: type(exc).__name__, BACKEND_KIND: "kubernetes"},
+                )
+                raise
 
-            # Simulate successful K8s API call
-            job_id = "job-xyz-123"
-            span.set_attribute("kubeflow.job_id", job_id)
-            span.set_status(Status(StatusCode.OK))
+            finally:
+                _op_latency.record(
+                    time.perf_counter() - t0,
+                    {OPERATION: "train", BACKEND_KIND: "kubernetes"},
+                )
 
-            return job_id
+    def get_job(self, job_name: str) -> dict:
+        """Fetch current job status."""
+        t0 = time.perf_counter()
+        with _tracer.start_as_current_span(
+            "MockTrainerClient.get_job",
+            kind=SpanKind.INTERNAL,
+        ) as span:
+            span.set_attribute(JOB_NAME, job_name)
 
-    
-    """
-    .train() reference comparision:
+            try:
+                result = self._backend.get_job(job_name)
+                span.set_attribute(JOB_STATUS, result["status"])
+                span.set_status(StatusCode.OK)
+                return result
 
-    from kubeflow/trainer/backends/kubernetes/backend.py import train
+            except Exception as exc:
+                span.set_status(StatusCode.ERROR, str(exc))
+                span.record_exception(exc)
+                _failures.add(
+                    1,
+                    {OPERATION: "get_job", ERROR_KIND: type(exc).__name__, BACKEND_KIND: "kubernetes"},
+                )
+                raise
 
-    def train(
-        self,
-        runtime: Optional[Union[str, types.Runtime]] = None,
-        initializer: Optional[types.Initializer] = None,
-        trainer: Optional[
-            Union[types.CustomTrainer, types.CustomTrainerContainer, types.BuiltinTrainer]
-        ] = None,
-        options: Optional[list] = None,
-    ) -> str:
-        # Process options to extract configuration
-        job_spec = {}
-        labels = None
-        annotations = None
-        name = None
-        spec_labels = None
-        spec_annotations = None
-        trainer_overrides = {}
-        pod_template_overrides = None
-
-        if options:
-            for option in options:
-                option(job_spec, trainer, self)
-
-            metadata_section = job_spec.get("metadata", {})
-            labels = metadata_section.get("labels")
-            annotations = metadata_section.get("annotations")
-            name = metadata_section.get("name")
-
-            # Extract spec-level labels/annotations and other spec configurations
-            spec_section = job_spec.get("spec", {})
-            spec_labels = spec_section.get("labels")
-            spec_annotations = spec_section.get("annotations")
-            trainer_overrides = spec_section.get("trainer", {})
-            pod_template_overrides = spec_section.get("podTemplateOverrides")
-
-        # Generate unique name for the TrainJob if not provided
-        train_job_name = name or (
-            random.choice(string.ascii_lowercase)
-            + uuid.uuid4().hex[: constants.JOB_NAME_UUID_LENGTH]
-        )
-
-        # Build the TrainJob spec using the common _get_trainjob_spec method
-        trainjob_spec = self._get_trainjob_spec(
-            runtime=runtime,
-            initializer=initializer,
-            trainer=trainer,
-            trainer_overrides=trainer_overrides,
-            spec_labels=spec_labels,
-            spec_annotations=spec_annotations,
-            pod_template_overrides=pod_template_overrides,
-        )
-
-        # Build the TrainJob.
-        train_job = models.TrainerV1alpha1TrainJob(
-            apiVersion=constants.API_VERSION,
-            kind=constants.TRAINJOB_KIND,
-            metadata=models.IoK8sApimachineryPkgApisMetaV1ObjectMeta(
-                name=train_job_name, labels=labels, annotations=annotations
-            ),
-            spec=trainjob_spec,
-        )
-
-        # Create the TrainJob.
-        try:
-            self.custom_api.create_namespaced_custom_object(
-                constants.GROUP,
-                constants.VERSION,
-                self.namespace,
-                constants.TRAINJOB_PLURAL,
-                train_job.to_dict(),
-            )
-        except multiprocessing.TimeoutError as e:
-            raise TimeoutError(
-                f"Timeout to create {constants.TRAINJOB_KIND}: {self.namespace}/{train_job_name}"
-            ) from e
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to create {constants.TRAINJOB_KIND}: {self.namespace}/{train_job_name}"
-            ) from e
-
-        logger.debug(
-            f"{constants.TRAINJOB_KIND} {self.namespace}/{train_job_name} has been created"
-        )
-
-        return train_job_name
-    """
+            finally:
+                _op_latency.record(
+                    time.perf_counter() - t0,
+                    {OPERATION: "get_job", BACKEND_KIND: "kubernetes"},
+                )
