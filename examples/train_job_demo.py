@@ -2,101 +2,98 @@
 """
 train_job_demo.py — End-user demo for the Kubeflow OTel PoC.
 
-This script represents the *application* side:
-  • It configures an OpenTelemetry TracerProvider (SDK dependency).
-  • It calls the instrumented MockTrainerClient (which uses only the API).
-  • It records GenAI semantic-convention attributes on the span.
+This script is the *application* side:
+  - It configures an OpenTelemetry TracerProvider (SDK + exporter).
+  - It calls MockTrainerClient, which uses the API only.
+
+Running it produces a three-span trace:
+
+    fine_tune_workflow                 [app tracer, INTERNAL]
+      └── MockTrainerClient.train      [sdk, INTERNAL]
+            └── MockKubernetesBackend.train  [sdk, CLIENT]
 
 Usage:
-    # Without Docker (spans printed to console):
+    # Spans printed to console (no Docker needed):
     python examples/train_job_demo.py
 
-    # With Docker (spans sent to Jaeger via OTel Collector):
+    # Spans sent to Jaeger via OTel Collector:
     docker compose up -d
     python examples/train_job_demo.py
-    # Then open http://localhost:16686 to view traces.
+    # Open http://localhost:16686 — service: kubeflow-training-demo
 """
-
-import sys
 import os
 import socket
+import sys
 
-# ── OpenTelemetry SDK configuration (app-side only) ─────────────────────────
 from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import (
-    BatchSpanProcessor,
-    ConsoleSpanExporter,
-)
 from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 
-
-def _is_collector_reachable(host: str = "localhost", port: int = 4317, timeout: float = 1.0) -> bool:
-    """Return True if the OTel Collector's gRPC port is accepting connections."""
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except (socket.timeout, ConnectionRefusedError, OSError):
-        return False
-
-
-# Attempt OTLP export; fall back to console if the collector is unreachable.
-try:
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
-        OTLPSpanExporter,
-    )
-
-    if not _is_collector_reachable():
-        raise RuntimeError("OTel Collector not reachable on localhost:4317")
-
-    exporter = OTLPSpanExporter(endpoint="localhost:4317", insecure=True)
-    export_target = "OTel Collector → Jaeger"
-except Exception:
-    exporter = ConsoleSpanExporter()
-    export_target = "Console (OTLP unavailable)"
-
-# Build the provider with a descriptive service name.
-resource = Resource.create({"service.name": "kubeflow-training-demo"})
-provider = TracerProvider(resource=resource)
-provider.add_span_processor(BatchSpanProcessor(exporter))
-trace.set_tracer_provider(provider)
-
-# ── Add the project root to sys.path so `sdk_mock` is importable ────────────
+# ── Add project root to sys.path so sdk_mock is importable ──────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from sdk_mock import MockTrainerClient  # noqa: E402
 
 
-def run_demo() -> None:
-    """Simulate an end-user fine-tuning an LLM via the Kubeflow SDK."""
+def _collector_available(host: str = "localhost", port: int = 4317) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return True
+    except OSError:
+        return False
 
-    # Application-level tracer (uses the SDK-configured provider).
+
+def _build_provider() -> tuple[TracerProvider, str]:
+    resource = Resource.create({
+        "service.name": "kubeflow-training-demo",
+        "service.version": "0.2.0",
+    })
+    provider = TracerProvider(resource=resource)
+
+    if _collector_available():
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        exporter = OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True)
+        target = "OTLP → Collector → Jaeger"
+    else:
+        exporter = ConsoleSpanExporter()
+        target = "Console (OTel Collector not reachable on :4317)"
+
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    return provider, target
+
+
+def run_demo() -> None:
+    provider, target = _build_provider()
+    trace.set_tracer_provider(provider)
+
+    print(f"\nKubeflow OTel PoC  —  exporting to: {target}\n")
+
+    client = MockTrainerClient(namespace="ml-team")
     app_tracer = trace.get_tracer("kubeflow-training-demo")
 
-    print(f"\n🚀  Kubeflow OTel PoC — exporting to: {export_target}\n")
+    with app_tracer.start_as_current_span("fine_tune_workflow") as root:
+        root.set_attribute("workflow.name", "llm-fine-tuning")
 
-    with app_tracer.start_as_current_span("fine_tune_workflow") as workflow_span:
-        workflow_span.set_attribute("workflow.name", "llm-fine-tuning")
-
-        client = MockTrainerClient()
-
-        # ── Submit a training job ──
-        job_id = client.train(trainer_func="my_lora_script.py", model_name="qwen-7b")
-        print(f"  ✅  Job submitted: {job_id}")
-
-        # ── Record GenAI token-usage attributes (semantic conventions) ──
-        workflow_span.set_attribute("gen_ai.usage.input_tokens", 1024)
-        workflow_span.set_attribute("gen_ai.usage.output_tokens", 256)
-        workflow_span.add_event(
-            "Fine-tuning started",
-            attributes={"gen_ai.request.model": "qwen-7b"},
+        # train() emits two spans beneath this one:
+        #   MockTrainerClient.train (INTERNAL) → MockKubernetesBackend.train (CLIENT)
+        job_name = client.train(
+            trainer_kind="CustomTrainer",
+            runtime="torch-distributed",
+            num_nodes=2,
+            # gen_ai.request.model is set only because we're referencing a model URI
+            model_name="hf://meta-llama/Llama-3",
         )
+        root.add_event("job_submitted", {"kubeflow.job.name": job_name})
+        print(f"  Job submitted : {job_name}")
 
-    # Ensure all spans are flushed before exit.
+        job = client.get_job(job_name)
+        print(f"  Job status    : {job['status']}")
+
     provider.force_flush()
     provider.shutdown()
 
-    print("\n🏁  Done — spans flushed.\n")
+    print("\nDone. Open Jaeger UI → http://localhost:16686  (service: kubeflow-training-demo)\n")
 
 
 if __name__ == "__main__":
